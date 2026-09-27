@@ -101,6 +101,46 @@ CREATE TABLE ext_zallet_keystore_standalone_sapling_keys (
 )
 "#;
 
+/// Stores encrypted standalone Orchard spending keys.
+///
+/// ### Columns
+///
+/// - `fvk` is the [`FullViewingKey`] derived from the spending key, serialized with
+///   [`FullViewingKey::to_bytes`].
+/// - `encrypted_orchard_sk` is the raw 32-byte [`SpendingKey`] in an
+///   [age encrypted file].
+///
+/// [`FullViewingKey`]: orchard::keys::FullViewingKey
+/// [`FullViewingKey::to_bytes`]: orchard::keys::FullViewingKey::to_bytes
+/// [`SpendingKey`]: orchard::keys::SpendingKey
+/// [age encrypted file]: https://c2sp.org/age#encrypted-file-format
+pub(crate) const TABLE_STANDALONE_ORCHARD_KEYS: &str = r#"
+CREATE TABLE ext_zallet_keystore_standalone_orchard_keys (
+    fvk BLOB NOT NULL UNIQUE,
+    encrypted_orchard_sk BLOB NOT NULL
+)
+"#;
+
+/// Stores encrypted standalone unified spending keys.
+///
+/// ### Columns
+///
+/// - `ufvk` is the [`UnifiedFullViewingKey`] derived from the spending key, encoded with
+///   [`UnifiedFullViewingKey::encode`].
+/// - `encrypted_usk` is the [`UnifiedSpendingKey`] in its `Era::Orchard` binary encoding in
+///   an [age encrypted file].
+///
+/// [`UnifiedFullViewingKey`]: zcash_keys::keys::UnifiedFullViewingKey
+/// [`UnifiedFullViewingKey::encode`]: zcash_keys::keys::UnifiedFullViewingKey::encode
+/// [`UnifiedSpendingKey`]: zcash_keys::keys::UnifiedSpendingKey
+/// [age encrypted file]: https://c2sp.org/age#encrypted-file-format
+pub(crate) const TABLE_STANDALONE_UNIFIED_KEYS: &str = r#"
+CREATE TABLE ext_zallet_keystore_standalone_unified_keys (
+    ufvk BLOB NOT NULL UNIQUE,
+    encrypted_usk BLOB NOT NULL
+)
+"#;
+
 /// Stores encrypted standalone transparent secret keys.
 ///
 /// ### Columns

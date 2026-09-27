@@ -65,7 +65,7 @@ Statuses:
 | `z_getoperationresult` | Implemented | |
 | `z_getoperationstatus` | Implemented | |
 | `z_gettotalbalance` | Implemented (deprecated) | `include_watchonly = false` is not yet honored; use the account-scoped `z_getbalanceforaccount` / `z_getbalances` instead ([#324](https://github.com/zcash/zallet/issues/324)) |
-| `z_importkey` | Implemented (altered) | Sapling extended spending keys only |
+| `z_importkey` | Implemented (altered) | Sapling extended spending keys, raw Orchard spending keys, and unified spending keys |
 | `z_importviewingkey` | Not yet implemented | Planned for Sapling keys, UFVKs, and UIVKs ([#80](https://github.com/zcash/zallet/issues/80)) |
 | `z_importwallet` | Omitted | Use `z_importkey` per key, or [`zallet migrate-zcashd-wallet`](../cli/migrate-zcashd-wallet.md); reconsideration tracked in [#81](https://github.com/zcash/zallet/issues/81) |
 | `z_listaccounts` | Implemented (altered) | [Changes](json_rpc.md#z_listaccounts) |

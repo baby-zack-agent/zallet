@@ -25,6 +25,17 @@ be considered breaking changes.
 
 ## [Unreleased]
 
+### Added
+
+- `z_exportkey` now accepts a unified address, and `z_importkey` now accepts Orchard
+  and unified spending keys in addition to Sapling extended spending keys. A unified
+  address exports the most complete key the wallet holds for it: a unified spending key
+  (versioned hex) first, then a raw Orchard spending key (64 hex characters) for its
+  Orchard receiver, then a Sapling extended spending key for its Sapling receiver.
+  Importing an Orchard spending key tracks it as an Orchard-only unified account;
+  importing a unified spending key tracks the full account. The result's
+  `address_type` is `"sapling"`, `"orchard"`, or `"unified"` accordingly.
+
 ### Fixed
 
 - `migrate-zcashd-wallet` now includes un-mined transactions when estimating

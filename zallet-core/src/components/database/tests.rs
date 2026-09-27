@@ -61,9 +61,13 @@ fn verify_schema() {
             #[cfg(zallet_build = "wallet")]
             keystore::db::TABLE_MNEMONICS,
             #[cfg(zallet_build = "wallet")]
+            keystore::db::TABLE_STANDALONE_ORCHARD_KEYS,
+            #[cfg(zallet_build = "wallet")]
             keystore::db::TABLE_STANDALONE_SAPLING_KEYS,
             #[cfg(zallet_build = "wallet")]
             keystore::db::TABLE_STANDALONE_TRANSPARENT_KEYS,
+            #[cfg(zallet_build = "wallet")]
+            keystore::db::TABLE_STANDALONE_UNIFIED_KEYS,
         ],
     );
 

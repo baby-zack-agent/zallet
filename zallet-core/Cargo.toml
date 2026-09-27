@@ -102,7 +102,7 @@ sapling.workspace = true
 secp256k1.workspace = true
 transparent.workspace = true
 zcash_encoding.workspace = true
-zcash_keys = { workspace = true, features = ["zcashd-compat", "unstable"] }
+zcash_keys = { workspace = true, features = ["zcashd-compat", "unstable", "unstable-frost"] }
 zcash_primitives.workspace = true
 zcash_proofs = { workspace = true, features = ["bundled-prover"] }
 zcash_script.workspace = true

@@ -125,6 +125,7 @@ use tokio::{
     time,
 };
 use zcash_client_sqlite::ExtensionTransaction;
+use zcash_protocol::consensus;
 use zip32::fingerprint::SeedFingerprint;
 
 use crate::network::Network;
@@ -137,7 +138,10 @@ use super::database::Database;
 
 use crate::fl;
 
+use orchard::keys::{FullViewingKey as OrchardFullViewingKey, SpendingKey as OrchardSpendingKey};
 use sapling::zip32::{DiversifiableFullViewingKey, ExtendedSpendingKey};
+use zcash_keys::address::UnifiedAddress;
+use zcash_keys::keys::{Era, UnifiedSpendingKey};
 
 #[cfg(feature = "transparent-key-import")]
 use {transparent::address::TransparentAddress, zcash_keys::address::Address};
@@ -837,6 +841,56 @@ impl KeyStore {
         })
     }
 
+    /// Encrypts a standalone Orchard spending key without touching the database.
+    ///
+    /// This is the fallible half of storing a standalone Orchard key: it needs the keystore
+    /// encryptor (unavailable while the wallet is locked), and it is async. Persist the
+    /// result with [`EncryptedStandaloneOrchardKey::insert`] to write it inside a wallet
+    /// transaction.
+    pub(crate) async fn encrypt_standalone_orchard_key(
+        &self,
+        orchard_key: &OrchardSpendingKey,
+    ) -> Result<EncryptedStandaloneOrchardKey, Error> {
+        let encryptor = self.encryptor().await?;
+
+        let fvk = OrchardFullViewingKey::from(orchard_key);
+        let encrypted_orchard_sk = encryptor
+            .encrypt_standalone_orchard_key(orchard_key)
+            .map_err(|e| ErrorKind::Generic.context(e))?;
+
+        Ok(EncryptedStandaloneOrchardKey {
+            fvk,
+            encrypted_orchard_sk,
+        })
+    }
+
+    /// Encrypts a standalone unified spending key without touching the database.
+    ///
+    /// This is the fallible half of storing a standalone unified key: it needs the keystore
+    /// encryptor (unavailable while the wallet is locked), and it is async. Persist the
+    /// result with [`EncryptedStandaloneUnifiedKey::insert`] to write it inside a wallet
+    /// transaction.
+    ///
+    /// `params` is used to encode the derived unified full viewing key that identifies the
+    /// stored key; only public viewing-key material is stored alongside the ciphertext.
+    pub(crate) async fn encrypt_standalone_unified_key<P: consensus::Parameters>(
+        &self,
+        params: &P,
+        unified_key: &UnifiedSpendingKey,
+    ) -> Result<EncryptedStandaloneUnifiedKey, Error> {
+        let encryptor = self.encryptor().await?;
+
+        let ufvk_encoded = unified_key.to_unified_full_viewing_key().encode(params);
+        let encrypted_usk = encryptor
+            .encrypt_standalone_unified_key(unified_key)
+            .map_err(|e| ErrorKind::Generic.context(e))?;
+
+        Ok(EncryptedStandaloneUnifiedKey {
+            ufvk_encoded,
+            encrypted_usk,
+        })
+    }
+
     /// Stores a pre-encrypted standalone Sapling key over a pooled connection.
     ///
     /// The upsert is idempotent; re-storing a key replaces any ciphertext already stored for it.
@@ -1110,6 +1164,127 @@ impl KeyStore {
         Ok(None)
     }
 
+    /// Looks up the standalone Orchard spending key whose full viewing key derives the given
+    /// Orchard receiver, if one is stored in the keystore.
+    pub(crate) async fn decrypt_standalone_orchard_key(
+        &self,
+        address: &orchard::Address,
+    ) -> Result<Option<OrchardSpendingKey>, Error> {
+        // Acquire a read lock on the identities for decryption.
+        let identities = self.identities.read().await;
+        if identities.is_empty() {
+            return Err(ErrorKind::Generic.context(fl!("err-wallet-locked")).into());
+        }
+
+        // Query all standalone Orchard keys and find the one matching the address.
+        let rows = self
+            .with_db(|conn, _| {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT fvk, encrypted_orchard_sk
+                         FROM ext_zallet_keystore_standalone_orchard_keys",
+                    )
+                    .map_err(|e| ErrorKind::Generic.context(e))?;
+
+                let rows = stmt
+                    .query_map([], |row| {
+                        Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+                    })
+                    .map_err(|e| ErrorKind::Generic.context(e))?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| ErrorKind::Generic.context(e))?;
+
+                Ok(rows)
+            })
+            .await?;
+
+        for (fvk_bytes, encrypted_sk) in rows {
+            let fvk_array: [u8; 96] = match fvk_bytes.try_into() {
+                Ok(arr) => arr,
+                Err(_) => continue,
+            };
+            let Some(fvk) = OrchardFullViewingKey::from_bytes(&fvk_array) else {
+                continue;
+            };
+            if fvk.scope_for_address(address).is_some() {
+                let sk = decrypt_standalone_orchard_sk(&identities, &encrypted_sk)?;
+
+                // The ciphertext is not bound to the FVK the row is keyed by, so verify
+                // that the decrypted key reproduces it.
+                if OrchardFullViewingKey::from(&sk).to_bytes() != fvk_array {
+                    return Err(ErrorKind::Generic
+                        .context(fl!("err-keystore-key-material-mismatch"))
+                        .into());
+                }
+
+                return Ok(Some(sk));
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Looks up the standalone unified spending key whose incoming viewing key derives all of
+    /// the shielded receivers in the given unified address, if one is stored in the keystore.
+    ///
+    /// A unified address with no shielded receivers never matches: this keystore holds only
+    /// shielded key material.
+    pub(crate) async fn decrypt_standalone_unified_key(
+        &self,
+        address: &UnifiedAddress,
+    ) -> Result<Option<UnifiedSpendingKey>, Error> {
+        // Acquire a read lock on the identities for decryption.
+        let identities = self.identities.read().await;
+        if identities.is_empty() {
+            return Err(ErrorKind::Generic.context(fl!("err-wallet-locked")).into());
+        }
+
+        // Query all standalone unified keys and find the one matching the address.
+        let (network, rows) = self
+            .with_db(|conn, network| {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT ufvk, encrypted_usk
+                         FROM ext_zallet_keystore_standalone_unified_keys",
+                    )
+                    .map_err(|e| ErrorKind::Generic.context(e))?;
+
+                let rows = stmt
+                    .query_map([], |row| {
+                        Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+                    })
+                    .map_err(|e| ErrorKind::Generic.context(e))?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| ErrorKind::Generic.context(e))?;
+
+                Ok((*network, rows))
+            })
+            .await?;
+
+        for (ufvk_bytes, encrypted_usk) in rows {
+            let usk = decrypt_standalone_unified_sk(&identities, &encrypted_usk)?;
+
+            // The ciphertext is not bound to the UFVK the row is keyed by, so verify
+            // that the decrypted key reproduces it.
+            if usk
+                .to_unified_full_viewing_key()
+                .encode(&network)
+                .as_bytes()
+                != ufvk_bytes
+            {
+                return Err(ErrorKind::Generic
+                    .context(fl!("err-keystore-key-material-mismatch"))
+                    .into());
+            }
+
+            if unified_spending_key_matches_address(&usk, address) {
+                return Ok(Some(usk));
+            }
+        }
+
+        Ok(None)
+    }
+
     #[cfg(feature = "transparent-key-import")]
     pub(crate) async fn decrypt_standalone_transparent_key(
         &self,
@@ -1256,6 +1431,22 @@ impl Encryptor {
         encrypt_secret(&self.recipients, &secret)
     }
 
+    fn encrypt_standalone_orchard_key(
+        &self,
+        key: &OrchardSpendingKey,
+    ) -> Result<Vec<u8>, age::EncryptError> {
+        let secret = SecretVec::new(key.to_bytes().to_vec());
+        encrypt_secret(&self.recipients, &secret)
+    }
+
+    fn encrypt_standalone_unified_key(
+        &self,
+        key: &UnifiedSpendingKey,
+    ) -> Result<Vec<u8>, age::EncryptError> {
+        let secret = SecretVec::new(key.to_bytes(Era::Orchard));
+        encrypt_secret(&self.recipients, &secret)
+    }
+
     #[cfg(feature = "zcashd-import")]
     fn encrypt_standalone_transparent_privkey(
         &self,
@@ -1305,6 +1496,113 @@ impl EncryptedStandaloneSaplingKey {
     /// transaction, so the write commits atomically with the caller's other wallet writes.
     pub(crate) fn insert(&self, ext: &ExtensionTransaction<'_>) -> rusqlite::Result<()> {
         self.store_with(|sql, params| ext.execute(sql, params))
+    }
+}
+
+/// Idempotent upsert for an encrypted standalone Orchard key, shared by the pooled-connection
+/// and in-transaction write paths so the SQL and table layout live in one place. The `fvk`
+/// key uniquely identifies the plaintext, so re-storing a key replaces the stored ciphertext,
+/// refreshing it to the current encryption recipients.
+const INSERT_STANDALONE_ORCHARD_KEY_SQL: &str =
+    "INSERT INTO ext_zallet_keystore_standalone_orchard_keys
+    VALUES (:fvk, :encrypted_orchard_sk)
+    ON CONFLICT (fvk) DO UPDATE SET encrypted_orchard_sk = :encrypted_orchard_sk ";
+
+/// An age-encrypted standalone Orchard spending key, ready to be persisted.
+///
+/// Produced by [`KeyStore::encrypt_standalone_orchard_key`]; holds only ciphertext and the
+/// derived (public) full viewing key used as the table's key, so it carries no plaintext.
+pub(crate) struct EncryptedStandaloneOrchardKey {
+    fvk: OrchardFullViewingKey,
+    encrypted_orchard_sk: Vec<u8>,
+}
+
+impl EncryptedStandaloneOrchardKey {
+    /// Runs the upsert against the given executor (a pooled connection or an extension
+    /// transaction), replacing any ciphertext already stored for this key.
+    fn store_with(
+        &self,
+        execute: impl FnOnce(&str, &[(&str, &dyn rusqlite::ToSql)]) -> rusqlite::Result<usize>,
+    ) -> rusqlite::Result<()> {
+        execute(
+            INSERT_STANDALONE_ORCHARD_KEY_SQL,
+            named_params! {
+                ":fvk": &self.fvk.to_bytes(),
+                ":encrypted_orchard_sk": self.encrypted_orchard_sk,
+            },
+        )?;
+        Ok(())
+    }
+
+    /// Writes this key into the keystore table using the given wallet-database extension
+    /// transaction, so the write commits atomically with the caller's other wallet writes.
+    pub(crate) fn insert(&self, ext: &ExtensionTransaction<'_>) -> rusqlite::Result<()> {
+        self.store_with(|sql, params| ext.execute(sql, params))
+    }
+}
+
+/// Idempotent upsert for an encrypted standalone unified key, shared by the pooled-connection
+/// and in-transaction write paths so the SQL and table layout live in one place. The `ufvk`
+/// key uniquely identifies the plaintext, so re-storing a key replaces the stored ciphertext,
+/// refreshing it to the current encryption recipients.
+const INSERT_STANDALONE_UNIFIED_KEY_SQL: &str =
+    "INSERT INTO ext_zallet_keystore_standalone_unified_keys
+    VALUES (:ufvk, :encrypted_usk)
+    ON CONFLICT (ufvk) DO UPDATE SET encrypted_usk = :encrypted_usk ";
+
+/// An age-encrypted standalone unified spending key, ready to be persisted.
+///
+/// Produced by [`KeyStore::encrypt_standalone_unified_key`]; holds only ciphertext and the
+/// derived (public) unified full viewing key encoding used as the table's key, so it carries
+/// no plaintext.
+pub(crate) struct EncryptedStandaloneUnifiedKey {
+    ufvk_encoded: String,
+    encrypted_usk: Vec<u8>,
+}
+
+impl EncryptedStandaloneUnifiedKey {
+    /// Runs the upsert against the given executor (a pooled connection or an extension
+    /// transaction), replacing any ciphertext already stored for this key.
+    fn store_with(
+        &self,
+        execute: impl FnOnce(&str, &[(&str, &dyn rusqlite::ToSql)]) -> rusqlite::Result<usize>,
+    ) -> rusqlite::Result<()> {
+        execute(
+            INSERT_STANDALONE_UNIFIED_KEY_SQL,
+            named_params! {
+                ":ufvk": &self.ufvk_encoded.as_bytes(),
+                ":encrypted_usk": self.encrypted_usk,
+            },
+        )?;
+        Ok(())
+    }
+
+    /// Writes this key into the keystore table using the given wallet-database extension
+    /// transaction, so the write commits atomically with the caller's other wallet writes.
+    pub(crate) fn insert(&self, ext: &ExtensionTransaction<'_>) -> rusqlite::Result<()> {
+        self.store_with(|sql, params| ext.execute(sql, params))
+    }
+}
+
+/// An age-encrypted standalone spending key of any supported kind, ready to be persisted.
+///
+/// This lets callers that accept several key formats (such as `z_importkey`) keep a single
+/// atomic account-import transaction instead of one per key kind.
+pub(crate) enum EncryptedStandaloneKey {
+    Sapling(Box<EncryptedStandaloneSaplingKey>),
+    Orchard(EncryptedStandaloneOrchardKey),
+    Unified(EncryptedStandaloneUnifiedKey),
+}
+
+impl EncryptedStandaloneKey {
+    /// Writes this key into its keystore table using the given wallet-database extension
+    /// transaction, so the write commits atomically with the caller's other wallet writes.
+    pub(crate) fn insert(&self, ext: &ExtensionTransaction<'_>) -> rusqlite::Result<()> {
+        match self {
+            EncryptedStandaloneKey::Sapling(key) => key.insert(ext),
+            EncryptedStandaloneKey::Orchard(key) => key.insert(ext),
+            EncryptedStandaloneKey::Unified(key) => key.insert(ext),
+        }
     }
 }
 
@@ -1425,6 +1723,100 @@ fn encrypt_secret(
     Ok(ciphertext)
 }
 
+/// The byte length of a raw Orchard spending key: a 32-byte scalar.
+const ORCHARD_SPENDING_KEY_BYTES: usize = 32;
+
+/// Encoding version for the unified spending key strings accepted and produced by
+/// `z_exportkey` / `z_importkey`.
+///
+/// Version 1 is the `UnifiedSpendingKey::to_bytes(Era::Orchard)` binary encoding prefixed
+/// with this version byte, hex-encoded. The prefix distinguishes the format from a raw
+/// 32-byte Orchard spending key (64 hex characters) and leaves room for future formats.
+const UNIFIED_SPENDING_KEY_VERSION: u8 = 1;
+
+/// Encodes a standalone Orchard spending key for the user: the raw 32-byte key as
+/// lowercase hex.
+///
+/// Unlike the unified spending key, a raw Orchard spending key needs no version byte: its
+/// fixed 64-hex-character length already distinguishes it from the other accepted formats.
+pub(crate) fn encode_orchard_spending_key(key: &OrchardSpendingKey) -> String {
+    hex::encode(key.to_bytes())
+}
+
+/// Decodes a standalone Orchard spending key from its hex encoding.
+pub(crate) fn decode_orchard_spending_key(s: &str) -> Result<OrchardSpendingKey, Error> {
+    let bytes =
+        hex::decode(s).map_err(|_| ErrorKind::Generic.context("Invalid Orchard spending key"))?;
+    let key_bytes: [u8; ORCHARD_SPENDING_KEY_BYTES] = bytes
+        .try_into()
+        .map_err(|_| ErrorKind::Generic.context("Invalid Orchard spending key"))?;
+    Option::from(OrchardSpendingKey::from_bytes(key_bytes)).ok_or_else(|| {
+        ErrorKind::Generic
+            .context("Invalid Orchard spending key")
+            .into()
+    })
+}
+
+/// Encodes a standalone unified spending key for the user: the version byte
+/// [`UNIFIED_SPENDING_KEY_VERSION`] followed by the `UnifiedSpendingKey::to_bytes(Era::Orchard)`
+/// binary encoding, hex-encoded.
+pub(crate) fn encode_unified_spending_key(key: &UnifiedSpendingKey) -> String {
+    let mut bytes = vec![UNIFIED_SPENDING_KEY_VERSION];
+    bytes.extend_from_slice(&key.to_bytes(Era::Orchard));
+    hex::encode(bytes)
+}
+
+/// Decodes a standalone unified spending key from its hex encoding.
+///
+/// The string must start with the version byte [`UNIFIED_SPENDING_KEY_VERSION`]; the
+/// version byte exists only in this user-facing encoding, while the keystore stores the
+/// unversioned `to_bytes(Era::Orchard)` plaintext.
+pub(crate) fn decode_unified_spending_key(s: &str) -> Result<UnifiedSpendingKey, Error> {
+    let invalid = || ErrorKind::Generic.context("Invalid unified spending key");
+    let bytes = hex::decode(s).map_err(|_| invalid())?;
+    let (version, rest) = bytes.split_first().ok_or_else(invalid)?;
+    if *version != UNIFIED_SPENDING_KEY_VERSION {
+        return Err(invalid().into());
+    }
+    UnifiedSpendingKey::from_bytes(Era::Orchard, rest).map_err(|_| invalid().into())
+}
+
+/// Returns whether the unified spending key's incoming viewing key derives every shielded
+/// receiver in the given unified address.
+///
+/// Each shielded receiver present in the address must be derivable from the key; an address
+/// with no shielded receivers at all never matches, since this keystore holds only shielded
+/// key material.
+pub(crate) fn unified_spending_key_matches_address(
+    usk: &UnifiedSpendingKey,
+    address: &UnifiedAddress,
+) -> bool {
+    let uivk = usk
+        .to_unified_full_viewing_key()
+        .to_unified_incoming_viewing_key();
+
+    let sapling_matches = address
+        .sapling()
+        .map(|receiver| {
+            uivk.sapling()
+                .as_ref()
+                .is_some_and(|ivk| ivk.decrypt_diversifier(receiver).is_some())
+        })
+        .unwrap_or(true);
+    let orchard_matches = address
+        .orchard()
+        .map(|receiver| {
+            uivk.orchard()
+                .as_ref()
+                .is_some_and(|ivk| ivk.diversifier_index(receiver).is_some())
+        })
+        .unwrap_or(true);
+
+    let has_shielded_receiver = address.sapling().is_some() || address.orchard().is_some();
+
+    has_shielded_receiver && sapling_matches && orchard_matches
+}
+
 fn decrypt_standalone_sapling_extsk(
     identities: &[Box<dyn age::Identity + Send + Sync>],
     ciphertext: &[u8],
@@ -1451,6 +1843,47 @@ fn decrypt_standalone_sapling_extsk(
         .map_err(|_| ErrorKind::Generic.context("Invalid Sapling extended spending key"))?;
 
     Ok(extsk)
+}
+
+/// Decrypts the age-encrypted standalone Orchard spending key stored by
+/// [`EncryptedStandaloneOrchardKey`].
+///
+/// The stored plaintext is the raw 32-byte key, matching [`encode_orchard_spending_key`]'s
+/// wire format minus the hex encoding.
+fn decrypt_standalone_orchard_sk(
+    identities: &[Box<dyn age::Identity + Send + Sync>],
+    ciphertext: &[u8],
+) -> Result<OrchardSpendingKey, Error> {
+    let secret =
+        decrypt_secret_bytes(identities, ciphertext).map_err(|e| ErrorKind::Generic.context(e))?;
+    let key_bytes: [u8; ORCHARD_SPENDING_KEY_BYTES] = secret
+        .expose_secret()
+        .as_slice()
+        .try_into()
+        .map_err(|_| ErrorKind::Generic.context("Invalid Orchard spending key"))?;
+    Option::from(OrchardSpendingKey::from_bytes(key_bytes)).ok_or_else(|| {
+        ErrorKind::Generic
+            .context("Invalid Orchard spending key")
+            .into()
+    })
+}
+
+/// Decrypts the age-encrypted standalone unified spending key stored by
+/// [`EncryptedStandaloneUnifiedKey`].
+///
+/// The stored plaintext is the unversioned `to_bytes(Era::Orchard)` binary encoding; the
+/// version byte exists only in the user-facing [`decode_unified_spending_key`] encoding.
+fn decrypt_standalone_unified_sk(
+    identities: &[Box<dyn age::Identity + Send + Sync>],
+    ciphertext: &[u8],
+) -> Result<UnifiedSpendingKey, Error> {
+    let secret =
+        decrypt_secret_bytes(identities, ciphertext).map_err(|e| ErrorKind::Generic.context(e))?;
+    UnifiedSpendingKey::from_bytes(Era::Orchard, secret.expose_secret()).map_err(|_| {
+        ErrorKind::Generic
+            .context("Invalid unified spending key")
+            .into()
+    })
 }
 
 #[cfg(feature = "transparent-key-import")]
@@ -1814,5 +2247,346 @@ mod tests {
                 "@/etc/age/recipients.txt".into()
             )),
         );
+    }
+}
+
+// -- Orchard and unified spending key codec and keystore tests --
+
+#[cfg(test)]
+mod orchard_unified_key_tests {
+    use orchard::keys::{
+        FullViewingKey as OrchardFullViewingKey, SpendingKey as OrchardSpendingKey,
+    };
+    use proptest::prelude::*;
+    use tempfile::tempdir;
+    use zcash_client_backend::data_api::{
+        AccountBirthday, AccountPurpose, WalletRead, WalletWrite, chain::ChainState,
+    };
+    use zcash_keys::keys::{Era, UnifiedAddressRequest, UnifiedFullViewingKey, UnifiedSpendingKey};
+    use zcash_primitives::block::BlockHash;
+    use zcash_protocol::consensus::BlockHeight;
+
+    use super::testing::{keystore as test_keystore, run_async};
+    use super::{
+        EncryptedStandaloneKey, ErrorKind, KeyStore, ORCHARD_SPENDING_KEY_BYTES,
+        UNIFIED_SPENDING_KEY_VERSION, decode_orchard_spending_key, decode_unified_spending_key,
+        encode_orchard_spending_key, encode_unified_spending_key,
+        unified_spending_key_matches_address,
+    };
+
+    fn test_network() -> crate::network::Network {
+        crate::network::Network::Consensus(zcash_protocol::consensus::Network::TestNetwork)
+    }
+
+    /// A deterministic Orchard spending key (the scalar 7) for codec and keystore tests.
+    fn orchard_spending_key() -> OrchardSpendingKey {
+        let mut bytes = [0u8; ORCHARD_SPENDING_KEY_BYTES];
+        bytes[0] = 7;
+        Option::from(OrchardSpendingKey::from_bytes(bytes))
+            .expect("the scalar 7 is a valid Orchard spending key")
+    }
+
+    /// A deterministic unified spending key (Sapling + Orchard components) for codec and
+    /// keystore tests.
+    fn unified_spending_key() -> UnifiedSpendingKey {
+        UnifiedSpendingKey::from_seed(&test_network(), &[7u8; 64], zip32::AccountId::ZERO)
+            .expect("any 64-byte seed yields a unified spending key")
+    }
+
+    proptest! {
+        #[test]
+        fn orchard_spending_key_hex_roundtrip(seed in prop::array::uniform32(0u8..)) {
+            // Only some 32-byte strings are valid scalars; skip the invalid ones.
+            let Some(sk) = Option::from(OrchardSpendingKey::from_bytes(seed)) else {
+                return Ok(());
+            };
+            let encoded = encode_orchard_spending_key(&sk);
+            prop_assert_eq!(encoded.len(), 2 * ORCHARD_SPENDING_KEY_BYTES);
+            let decoded = decode_orchard_spending_key(&encoded).unwrap();
+            prop_assert_eq!(decoded.to_bytes(), sk.to_bytes());
+        }
+
+        #[test]
+        fn unified_spending_key_hex_roundtrip(seed in any::<[u8; 64]>()) {
+            let network = test_network();
+            let usk = UnifiedSpendingKey::from_seed(&network, &seed, zip32::AccountId::ZERO)
+                .expect("any 64-byte seed yields a unified spending key");
+            let encoded = encode_unified_spending_key(&usk);
+            // The version byte is the first byte of the decoded payload.
+            let raw = hex::decode(&encoded).unwrap();
+            prop_assert_eq!(raw[0], UNIFIED_SPENDING_KEY_VERSION);
+            let decoded = decode_unified_spending_key(&encoded).unwrap();
+            prop_assert_eq!(
+                decoded.to_unified_full_viewing_key().encode(&network),
+                usk.to_unified_full_viewing_key().encode(&network),
+            );
+        }
+    }
+
+    #[test]
+    fn unified_spending_key_decode_rejects_unknown_version() {
+        let usk = unified_spending_key();
+        let mut raw = usk.to_bytes(Era::Orchard);
+        raw[0] = raw[0].wrapping_add(1);
+        let mut encoded = vec![UNIFIED_SPENDING_KEY_VERSION.wrapping_add(1)];
+        encoded.extend_from_slice(&raw);
+        assert!(decode_unified_spending_key(&hex::encode(encoded)).is_err());
+    }
+
+    #[test]
+    fn unified_spending_key_decode_rejects_truncation() {
+        let encoded = encode_unified_spending_key(&unified_spending_key());
+        assert!(decode_unified_spending_key(&encoded[..encoded.len() - 2]).is_err());
+        assert!(decode_unified_spending_key("").is_err());
+    }
+
+    #[test]
+    fn orchard_spending_key_decode_rejects_bad_input() {
+        // Not hex.
+        assert!(decode_orchard_spending_key("not-hex").is_err());
+        // Valid hex, wrong length. (The underlying `from_bytes` accepts essentially
+        // every 32-byte input, so length and hex validity are what the decoder
+        // enforces.)
+        assert!(decode_orchard_spending_key(&"00".repeat(31)).is_err());
+        assert!(decode_orchard_spending_key(&"00".repeat(33)).is_err());
+        assert!(decode_orchard_spending_key("").is_err());
+    }
+
+    /// Stores an Orchard spending key via the same `transactionally_with_extension` path
+    /// `z_importkey` uses (with no wallet-side write in this helper).
+    async fn store_orchard_key(keystore: &KeyStore, sk: &OrchardSpendingKey) {
+        let encrypted = EncryptedStandaloneKey::Orchard(
+            keystore.encrypt_standalone_orchard_key(sk).await.unwrap(),
+        );
+        keystore.db.handle().await.unwrap().with_mut(|mut db_data| {
+            db_data
+                .transactionally_with_extension(|_, ext| encrypted.insert(ext))
+                .unwrap();
+        });
+    }
+
+    /// Stores a unified spending key via the same `transactionally_with_extension` path
+    /// `z_importkey` uses (with no wallet-side write in this helper).
+    async fn store_unified_key(
+        keystore: &KeyStore,
+        params: &crate::network::Network,
+        usk: &UnifiedSpendingKey,
+    ) {
+        let encrypted = EncryptedStandaloneKey::Unified(
+            keystore
+                .encrypt_standalone_unified_key(params, usk)
+                .await
+                .unwrap(),
+        );
+        keystore.db.handle().await.unwrap().with_mut(|mut db_data| {
+            db_data
+                .transactionally_with_extension(|_, ext| encrypted.insert(ext))
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn standalone_orchard_key_lookup_matches_by_receiver() {
+        let datadir = tempdir().unwrap();
+
+        run_async(|| async {
+            let keystore = test_keystore(&datadir).await;
+            let sk = orchard_spending_key();
+            let fvk = OrchardFullViewingKey::from(&sk);
+            let expected_address = fvk.address_at(
+                zip32::DiversifierIndex::new(),
+                orchard::keys::Scope::External,
+            );
+
+            store_orchard_key(&keystore, &sk).await;
+
+            let found = keystore
+                .decrypt_standalone_orchard_key(&expected_address)
+                .await
+                .unwrap()
+                .expect("the stored key must be found by its receiver");
+            assert_eq!(found.to_bytes(), sk.to_bytes());
+
+            // An unrelated Orchard address must not match.
+            let mut other_bytes = [0u8; ORCHARD_SPENDING_KEY_BYTES];
+            other_bytes[0] = 9;
+            let other_sk: OrchardSpendingKey =
+                Option::from(OrchardSpendingKey::from_bytes(other_bytes)).unwrap();
+            let other_fvk = OrchardFullViewingKey::from(&other_sk);
+            let other_address = other_fvk.address_at(
+                zip32::DiversifierIndex::new(),
+                orchard::keys::Scope::External,
+            );
+            assert!(
+                keystore
+                    .decrypt_standalone_orchard_key(&other_address)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        });
+    }
+
+    #[test]
+    fn standalone_unified_key_lookup_matches_by_unified_address() {
+        let datadir = tempdir().unwrap();
+
+        run_async(|| async {
+            let keystore = test_keystore(&datadir).await;
+            let network = test_network();
+            let usk = unified_spending_key();
+
+            store_unified_key(&keystore, &network, &usk).await;
+
+            // The key matches a unified address carrying all of its receivers...
+            let ufvk = usk.to_unified_full_viewing_key();
+            let (ua, _) = ufvk
+                .default_address(UnifiedAddressRequest::AllAvailableKeys)
+                .unwrap();
+            assert!(unified_spending_key_matches_address(&usk, &ua));
+            let found = keystore
+                .decrypt_standalone_unified_key(&ua)
+                .await
+                .unwrap()
+                .expect("the stored key must be found by its unified address");
+            assert_eq!(
+                found.to_unified_full_viewing_key().encode(&network),
+                ufvk.encode(&network)
+            );
+
+            // ... but not a unified address whose receivers it cannot derive.
+            let other_usk =
+                UnifiedSpendingKey::from_seed(&network, &[9u8; 64], zip32::AccountId::ZERO)
+                    .unwrap();
+            let (other_ua, _) = other_usk
+                .to_unified_full_viewing_key()
+                .default_address(UnifiedAddressRequest::AllAvailableKeys)
+                .unwrap();
+            assert!(!unified_spending_key_matches_address(&usk, &other_ua));
+            assert!(
+                keystore
+                    .decrypt_standalone_unified_key(&other_ua)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        });
+    }
+
+    /// When the wallet holds both a full unified spending key and the standalone
+    /// Orchard key for its Orchard receiver, exporting the unified address must
+    /// return the unified key: it authorizes every receiver, while the Orchard
+    /// key authorizes only one.
+    #[test]
+    fn unified_export_prefers_full_usk_over_component_keys() {
+        use crate::components::json_rpc::methods::export_key::export_unified_key;
+
+        let datadir = tempdir().unwrap();
+
+        run_async(|| async {
+            let keystore = test_keystore(&datadir).await;
+            let network = test_network();
+            let usk = unified_spending_key();
+            let orchard_sk = *usk.orchard();
+
+            // Store the component Orchard key FIRST, so the test proves the
+            // export prefers the USK rather than returning the first match.
+            store_orchard_key(&keystore, &orchard_sk).await;
+            store_unified_key(&keystore, &network, &usk).await;
+
+            let (ua, _) = usk
+                .to_unified_full_viewing_key()
+                .default_address(UnifiedAddressRequest::AllAvailableKeys)
+                .unwrap();
+
+            let exported = export_unified_key(&network, &keystore, &ua)
+                .await
+                .expect("export must succeed")
+                .0;
+
+            assert_eq!(exported, encode_unified_spending_key(&usk));
+            assert_ne!(exported, encode_orchard_spending_key(&orchard_sk));
+        });
+    }
+
+    /// A failure injected after both writes of the import transaction must roll back both:
+    /// the wallet must not track an account whose key is missing, and the keystore must
+    /// not hold a key for an account the wallet doesn't scan.
+    #[test]
+    fn standalone_key_import_transaction_rolls_back_on_failure() {
+        #[derive(Debug)]
+        enum AtomicityError {
+            #[allow(dead_code)]
+            Database(zcash_client_sqlite::error::SqliteClientError),
+            Injected,
+        }
+
+        impl From<rusqlite::Error> for AtomicityError {
+            fn from(e: rusqlite::Error) -> Self {
+                AtomicityError::Database(e.into())
+            }
+        }
+
+        let datadir = tempdir().unwrap();
+
+        run_async(|| async {
+            let keystore = test_keystore(&datadir).await;
+            let sk = orchard_spending_key();
+            let encrypted = EncryptedStandaloneKey::Orchard(
+                keystore.encrypt_standalone_orchard_key(&sk).await.unwrap(),
+            );
+            let ufvk =
+                UnifiedFullViewingKey::from_orchard_fvk(OrchardFullViewingKey::from(&sk)).unwrap();
+            let birthday = AccountBirthday::from_parts(
+                ChainState::empty(BlockHeight::from_u32(0), BlockHash([0u8; 32])),
+                None,
+            );
+
+            // Mirror the `z_importkey` transaction: a wallet account import paired with the
+            // keystore write, with an injected failure after both writes.
+            let handle = keystore.db.handle().await.unwrap();
+            let res: Result<(), AtomicityError> = handle.with_mut(|mut db_data| {
+                db_data.transactionally_with_extension(|wdb, ext| {
+                    wdb.import_account_ufvk(
+                        "atomicity test",
+                        &ufvk,
+                        &birthday,
+                        AccountPurpose::Spending { derivation: None },
+                        None,
+                    )
+                    .map_err(AtomicityError::Database)?;
+                    encrypted.insert(ext)?;
+                    Err(AtomicityError::Injected)
+                })
+            });
+            assert!(
+                matches!(res, Err(AtomicityError::Injected)),
+                "the injected failure must surface, not a database error: {res:?}"
+            );
+
+            // Neither write persisted: no account for the UFVK...
+            let account = handle.with(|db_data| db_data.get_account_for_ufvk(&ufvk).unwrap());
+            assert!(
+                account.is_none(),
+                "a rolled-back account import must not leave an account behind"
+            );
+
+            // ... and no keystore row.
+            let stored: u32 = keystore
+                .with_db(|conn, _| {
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM ext_zallet_keystore_standalone_orchard_keys",
+                        [],
+                        |row| row.get::<_, u32>(0),
+                    )
+                    .map_err(|e| ErrorKind::Generic.context(e).into())
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                stored, 0,
+                "a rolled-back keystore write must not leave a row behind"
+            );
+        });
     }
 }

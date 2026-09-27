@@ -39,7 +39,7 @@ mod convert_tex;
 mod decode_raw_transaction;
 mod decode_script;
 #[cfg(zallet_build = "wallet")]
-mod export_key;
+pub(crate) mod export_key;
 mod get_account;
 mod get_address_for_account;
 #[cfg(zallet_build = "wallet")]
